@@ -1,14 +1,16 @@
 # Échec & Match
 
-Application de rencontre + apéro + échecs, avec authentification et données réelles via Supabase (plus aucune simulation : comptes, profils, matchs, chat et parties d'échecs sont persistés et synchronisés en temps réel).
+Application de rencontre + apéro + échecs, avec authentification et données réelles via Supabase (comptes, profils, matchs, chat, parties d'échecs et abonnements Premium sont persistés et synchronisés en temps réel — aucune donnée simulée).
+
+Pour l'historique de l'audit de sécurité et la liste des limites connues, voir [`SECURITY.md`](./SECURITY.md).
 
 ## 1. Créer le projet Supabase
 
 1. Allez sur [supabase.com](https://supabase.com) → **New project**.
-2. Une fois créé, ouvrez **SQL Editor** → **New query**, collez le contenu de `supabase/schema.sql`, puis **Run**.
-   Cela crée les tables `profiles`, `swipes`, `matches`, `messages`, `games`, `blocked_users`, `reports`, les policies RLS, les triggers (création automatique du profil, matching mutuel), le bucket de stockage `avatars`, et active le Realtime.
-3. Dans **Authentication → Settings**, laissez **"Confirm email" activé** (c'est le comportement par défaut) — l'inscription n'est validée qu'après clic sur le lien reçu par email. C'est un prérequis avant tout lancement public.
-4. Dans **Authentication → Email Templates**, personnalisez le template de confirmation (logo, texte en français) avant le lancement. Exemple de template "Confirm signup" en français à coller :
+2. Une fois créé, ouvrez **SQL Editor** → **New query**, collez l'intégralité de `supabase/schema.sql`, puis **Run**.
+   Cela crée toutes les tables (`profiles`, `swipes`, `matches`, `messages`, `games`, `game_history`, `blocked_users`, `reports`, `profile_photos`, `referrals`, `match_reads`), les policies RLS, les fonctions et triggers serveur, le bucket de stockage `avatars`, et active le Realtime — voir la section [Structure de la base](#structure-de-la-base) plus bas pour le détail de chaque table.
+3. Dans **Authentication → Settings**, laissez **"Confirm email" activé** (comportement par défaut) — l'inscription n'est validée qu'après clic sur le lien reçu par email. Prérequis pour que le système de parrainage fonctionne.
+4. Dans **Authentication → Email Templates**, personnalisez le template de confirmation (logo, texte en français) avant le lancement. Exemple de template "Confirm signup" à coller :
 
    **Subject** : `Confirmez votre inscription à Échec & Match`
 
@@ -20,7 +22,7 @@ Application de rencontre + apéro + échecs, avec authentification et données r
    <p>Si vous n'êtes pas à l'origine de cette demande, ignorez cet email.</p>
    ```
 
-   Faites de même pour "Reset password" (Réinitialisation du mot de passe) et "Magic Link" si vous les utilisez.
+   Faites de même pour "Reset password" et "Magic Link" si vous les utilisez.
 5. Récupérez vos clés dans **Project Settings → API** :
    - `Project URL`
    - `anon public` key
@@ -60,72 +62,75 @@ npm run build
 ```
 Déployez le dossier `dist/` (via `netlify deploy` ou glisser-déposer sur app.netlify.com). Ajoutez les mêmes variables d'environnement dans Site settings → Environment variables.
 
+## 4. Se désigner administrateur (optionnel)
+
+Aucune interface ne permet de s'accorder le rôle admin — c'est volontaire, pour qu'il ne soit jamais accessible via l'application elle-même. Une fois votre compte créé, exécutez dans le SQL Editor de Supabase :
+
+```sql
+update public.profiles set is_admin = true where email = 'vous@gmail.com';
+```
+
+Un onglet "🛡️ Admin" apparaît alors dans l'app, avec statistiques d'usage et liste des signalements.
+
 ## Comment ça fonctionne
 
-- **Auth** : `supabase.auth.signUp` (avec confirmation email obligatoire) / `signInWithPassword` / `signOut`, session persistée automatiquement par le SDK. Le profil est créé **côté serveur** par un trigger Postgres dès l'inscription (avant même la confirmation), à partir des métadonnées passées à `signUp`.
-- **Âge** : date de naissance obligatoire, âge calculé côté client ET vérifié — bloque toute inscription en dessous de 18 ans.
-- **Photos** : upload réel vers Supabase Storage (bucket `avatars`, public en lecture, écriture restreinte à son propre dossier).
-- **Profils à swiper** : requête sur `profiles` en excluant les profils déjà swipés et les utilisateurs bloqués (dans les deux sens).
-- **Matchs** : chaque swipe est enregistré dans `swipes` ; un trigger PostgreSQL détecte automatiquement quand deux personnes se sont swipées "à droite" mutuellement et crée une ligne dans `matches`.
-- **Chat** : table `messages`, avec un abonnement Realtime Supabase pour recevoir les nouveaux messages instantanément. Menu "⋯" pour signaler ou bloquer.
-- **Modération** : table `reports` (signalements consultables uniquement via la clé `service_role`, côté back-office) et `blocked_users` (le blocage exclut immédiatement la personne des profils à swiper et de la liste de matchs).
-- **Suppression de compte** : fonction RPC `delete_own_account()` supprime le profil et, par cascade, toutes les données liées. **Limite connue** : la ligne `auth.users` elle-même doit être supprimée côté serveur avec la clé `service_role` (via une Edge Function ou le dashboard) — l'anon key ne le permet pas pour des raisons de sécurité. Prévoir cette Edge Function avant le lancement public si la suppression complète du compte auth est requise légalement (RGPD).
-- **Échecs** : table `games` (une par match), état du plateau stocké en JSON, synchronisé en temps réel avec l'adversaire via Realtime. **Chaque coup est désormais validé côté serveur** par la fonction `make_chess_move()` (security definer) qui réimplémente les règles de déplacement (pion, cavalier, fou, tour, dame, roi, y compris le blocage sur les pièces glissantes) — un client malveillant ne peut plus forcer un coup illégal ni jouer hors tour, même en appelant l'API directement. La table `games` n'accepte plus d'`UPDATE` direct que pour réinitialiser une partie (retour à la position de départ) ; tout coup de jeu doit passer par cette fonction.
-- **Quitter un match** : bouton "Quitter la table" dans le menu du chat, supprime le match (et en cascade messages/partie associés).
-- **Anti-spam** : triggers Postgres limitant à 20 messages/minute et 60 swipes/minute par utilisateur — au-delà, l'insertion est rejetée côté serveur.
-- **Mot de passe** : minimum 8 caractères avec au moins une lettre et un chiffre.
-- **Ordre des profils** : mélangé aléatoirement côté client à chaque chargement (évite que les mêmes profils soient toujours vus en premier).
-- **Sécurité** : Row Level Security activé sur toutes les tables — chacun ne peut lire/écrire que ses propres données ou celles des matchs dont il fait partie.
-- **Présence en ligne** : channel Supabase Realtime Presence — chaque utilisateur connecté "track" sa présence, affichée en badge vert sur les profils et matchs en ligne au même moment.
-- **Elo & historique** : table `game_history` + fonction RPC `record_chess_win` (security definer, formule Elo standard K=32) — appelée automatiquement à chaque échec et mat, met à jour l'Elo des deux joueurs et journalise la partie. Consultable dans l'onglet Profil.
-- **Thèmes de plateau** : 4 presets stockés dans `profiles.board_theme`, sélectionnables depuis le profil.
-- **Onboarding** : modal 4 étapes affiché une seule fois après la première connexion (flag en `localStorage`, pas en base — donc propre à chaque appareil).
-- **Résilience réseau** : une bannière apparaît en cas de perte de connexion (`navigator.onLine`) ; au retour du réseau, le deck de profils, la liste des matchs, le chat et la partie d'échecs en cours se rechargent automatiquement plutôt que de rester figés sur un état périmé.
-- **Pagination** : les profils à swiper sont chargés par pages de 20 (`range()`), la page suivante se charge automatiquement quand il n'en reste plus que 5 dans la pile — pas de limite artificielle sur la taille de la base.
-- **Filtres de recherche** : âge min/max, Elo minimum, distance maximale — appliqués côté client sur le lot de profils chargé.
-- **Distance** : chaque profil peut partager sa position (bouton dans l'onglet Profil, `navigator.geolocation`) ; la distance est calculée avec la formule de Haversine et affichée sur les cartes.
-- **Notifications navigateur** : après activation (bouton dans Profil, `Notification.requestPermission()`), une notification système apparaît pour un nouveau match ou message reçu **pendant que l'onglet est en arrière-plan**. Limite importante : ceci ne fonctionne que si l'application est ouverte dans un onglet (même en arrière-plan) — recevoir des notifications quand l'app est complètement fermée nécessiterait un Service Worker + push VAPID + une Edge Function côté serveur, non inclus ici.
+### Compte et inscription
+- **Auth** : `supabase.auth.signUp` (confirmation email obligatoire) / `signInWithPassword` / `signOut`, session persistée automatiquement par le SDK. Le profil est créé **côté serveur** par un trigger Postgres dès l'inscription (avant même la confirmation), à partir des métadonnées passées à `signUp` — jamais par un insert direct du client.
+- **Âge** : date de naissance obligatoire, vérifiée côté client ET côté serveur — bloque toute inscription en dessous de 18 ans, même via un appel direct à l'API.
+- **Domaines email restreints** : seules les adresses Gmail, Outlook et iCloud sont acceptées (vérifié client + serveur), pour limiter les faux comptes créés avec des boîtes mail jetables.
+- **CGU** : la case à cocher est réellement vérifiée côté serveur (`accepted_terms` dans les métadonnées) — impossible de créer un compte sans elle. Le texte affiché (`LegalModal` dans `App.jsx`) est indicatif, à faire valider par un juriste avant tout lancement public.
+- **Genre, orientation, préférences de visibilité** : trois champs (`gender`, `orientation`, `looking_for`) collectés à l'inscription et modifiables depuis le profil. La visibilité dans le deck de swipe est **mutuelle** : un profil n'apparaît que si vous correspondez à ce qu'iel recherche, et inversement. Affichés en badges sur les cartes.
+- **Mot de passe** : minimum 8 caractères, au moins une lettre et un chiffre.
 
-## Limites connues à traiter avant un lancement à grande échelle
+### Photos
+- **Photos multiples + carrousel**, pour tous les comptes y compris gratuits — jusqu'à 6 par profil (`profile_photos`, limite appliquée côté serveur), galerie de gestion dans le profil (ajout, suppression, définir comme photo principale), et vrai carrousel sur les cartes de swipe (zones tactiles gauche/droite, points indicateurs).
+- **Photo de profil obligatoire** : un écran dédié (`MandatoryPhotoScreen`) bloque tout accès à l'application tant qu'aucune photo n'a été ajoutée ; la navigation reste cachée jusque-là.
+- Upload réel vers Supabase Storage (bucket `avatars`, 5 Mo max, images uniquement, écriture restreinte à son propre dossier).
 
-- Suppression complète du compte `auth.users` (nécessite une Edge Function avec la clé `service_role` — l'anon key ne le permet pas).
-- Les CGU/politique de confidentialité affichées dans l'app sont un texte indicatif, à faire valider par un juriste.
+### Rencontre
+- **Profils à swiper** : exclut les profils déjà swipés et les utilisateurs bloqués (dans les deux sens), respecte la visibilité mutuelle de genre, mélangés aléatoirement, paginés par lots de 20 (la page suivante se charge automatiquement).
+- **Filtres** : âge min/max, Elo minimum, distance maximale.
+- **Distance** : partage de position optionnel (`navigator.geolocation`), distance calculée côté serveur (formule de Haversine) et affichée sur les cartes — jamais les coordonnées brutes envoyées au client.
+- **Revoir les profils passés** : les profils swipés à gauche sont mémorisés en session ; un bouton en bout de liste permet de les réinjecter dans le deck.
+- **Matchs** : chaque swipe est enregistré (`swipes`) ; un trigger détecte le mutuel et crée une ligne dans `matches`.
+- **Aperçu du dernier message + non-lu** : la liste des matchs affiche le dernier message échangé, avec un badge numéroté par conversation (`match_reads`, marqué comme lu à l'ouverture et à chaque nouveau message reçu). Le badge de l'onglet "Matchs" reflète le nombre de conversations non lues.
+- **Quitter un match** : bouton "Quitter la table" dans le menu du chat, supprime le match et, par cascade, messages/partie associés.
+- **Chat** : messages en temps réel (Realtime), menu "⋯" pour signaler ou bloquer.
+- **Modération** : `blocked_users` exclut immédiatement la personne des profils à swiper, des matchs et du chat, dans les deux sens — appliqué par les policies RLS, pas seulement caché côté interface. `reports` permet de signaler un profil **avec ou sans match existant** (bouton "⚑" sur les cartes de swipe et menu dans le chat) ; consultable via le tableau de bord admin.
+- **Suppression de compte** : `delete_own_account()` supprime le profil et, par cascade, toutes les données liées (voir limite connue dans `SECURITY.md`).
 
-## Audit de sécurité — failles corrigées
+### Échecs
+- **Parties en temps réel** : une ligne par match (`games`), plateau stocké en JSON, synchronisé via Realtime.
+- **Coups validés côté serveur** : `make_chess_move()` réimplémente les règles de déplacement (pion, cavalier, fou, tour, dame, roi, blocage sur les pièces glissantes) — un client malveillant ne peut ni jouer un coup illégal ni jouer hors tour. `games` n'accepte un `UPDATE` direct que pour réinitialiser la partie ; tout coup passe par cette fonction.
+- **Elo & historique** : `record_chess_win()` (formule standard K=32) met à jour l'Elo des deux joueurs et journalise la partie dans `game_history` à chaque échec et mat.
+- **Thèmes de plateau** : 4 presets (2 exclusifs aux comptes Premium, verrouillés par une contrainte `CHECK` sur `profiles`, pas seulement caché dans l'interface).
+- **Statistiques** : taux de victoire, série en cours, calculés dans l'onglet Profil (historique limité à 5 parties pour les comptes gratuits, plus pour Premium).
 
-Une relecture complète a révélé et corrigé les failles suivantes :
+### Premium
+Deux façons de débloquer le Premium, aucune bascule manuelle : le parrainage se déclenche une seule fois, le partage est répétable à volonté.
+- **Parrainage** (une seule fois) : 2 personnes doivent s'inscrire **et confirmer leur email** → 1 mois de Premium offert, **une seule fois** — un 3e, 4e... filleul ne rapporte rien de plus via ce mécanisme. Code de parrainage unique par profil (`referral_code`) et lien partageable (`?ref=CODE`, pré-rempli automatiquement à l'inscription). La confirmation est détectée par un trigger sur `auth.users`, mais l'octroi du Premium est **différé de 48h** (`evaluate_referral_rewards()`, appelée à chaque chargement de profil) pour empêcher la fraude "confirmer puis supprimer aussitôt" — voir `SECURITY.md` pour le détail des garde-fous anti-fraude.
+- **Partages** : 2 semaines de Premium par tranche de **5 ouvertures distinctes** de votre lien de parrainage. Contrairement à l'ancienne version, ce n'est plus le clic sur "Partager" qui est compté (un clic ne prouve rien — on peut cliquer chez soi sans jamais rien envoyer à personne), mais l'**ouverture réelle du lien par un navigateur différent** du vôtre. Chaque navigateur reçoit un identifiant anonyme (`visitor_id`, stocké en `localStorage`) dès sa première visite ; `record_link_open()` (callable même par un visiteur non connecté) enregistre l'ouverture uniquement si ce `visitor_id` diffère de celui associé à votre propre compte — s'auto-envoyer son propre lien ne compte donc plus. `evaluate_link_open_rewards()` accorde la récompense par tranches de 5, appelée comme les autres à chaque chargement de profil.
+- **Expiration réelle** : `premium_until` est vérifié dans toutes les policies sensibles (Super Trinque, "qui m'a trinqué", limite de swipes), pas seulement le booléen `is_premium`. `settle_my_premium_status()` (appelée à chaque chargement de profil) remet `is_premium` à `false` une fois expiré.
+- **Fonctionnalités Premium** : Super Trinque (⭐ super-like), Rewind (annuler le dernier swipe), "Qui m'a trinqué" (voir les swipes reçus avant d'y répondre), swipes illimités (25/jour pour les comptes gratuits), thèmes de plateau exclusifs, historique de parties complet.
+- `is_premium`, `premium_until`, `referral_code`, `referred_by`, `referral_rewards_granted`, `link_opens_rewards_granted` sont exclus de tout `GRANT UPDATE` direct — aucun de ces champs n'est modifiable par un client, même en appelant l'API sans passer par l'app. `visitor_id`, lui, est volontairement modifiable (c'est un identifiant anonyme non sensible).
 
-1. **Fuite de données personnelles (critique)** — la policy de lecture sur `profiles` autorisait n'importe quel utilisateur connecté à lire l'email, la date de naissance et les **coordonnées GPS exactes** de tout le monde (pas seulement des profils affichés dans l'app — via un appel direct à l'API). Corrigé : `profiles` ne peut plus être lu que par son propriétaire ; les autres utilisateurs passent par la nouvelle vue `public_profiles`, qui n'expose que les champs non sensibles et une **distance déjà calculée côté serveur** (jamais les coordonnées brutes).
-2. **Triche sur l'Elo (élevé)** — rien n'empêchait un utilisateur d'appeler directement `update profiles set elo = 9999` sur son propre compte. Corrigé : les droits `UPDATE` sur `profiles` sont désormais restreints par colonne (`revoke` + `grant` ciblé) — l'Elo ne peut plus être modifié que par la fonction serveur `record_chess_win`.
-3. **Plateau d'échecs truqué à la création (élevé)** — la policy d'insertion sur `games` ne vérifiait pas le contenu du plateau, un client aurait pu créer une partie avec une position déjà gagnante. Corrigé : l'insertion exige désormais explicitement la position de départ standard.
-4. **Détournement de `search_path` (moyen, bonne pratique Postgres/Supabase)** — les fonctions `SECURITY DEFINER` (qui s'exécutent avec des privilèges élevés) ne fixaient pas leur `search_path`, ce qui les rend théoriquement détournables. Corrigé : `set search_path = public, pg_temp` ajouté aux 7 fonctions concernées.
-5. **Table inutilisée** — `match_reads` (indicateur de lecture) avait été créée mais n'était jamais utilisée par le client ; supprimée pour réduire la surface d'attaque inutile.
+### Administration
+- **Tableau de bord admin** : statistiques globales (`admin_get_stats()`) et liste des signalements avec noms des personnes concernées (`admin_get_reports()`, sans jamais exposer email/GPS/date de naissance) — deux fonctions RPC réservées aux comptes `is_admin`.
+- `is_admin` n'est accordable qu'en SQL direct (voir section 4 plus haut), jamais via l'application.
 
-## Deuxième passe de sécurité
+### Produit
+- **Landing page** avant la connexion (pitch, fonctionnalités clés, boutons d'action).
+- **Mode clair** : bouton ☀️/🌙 persisté, fond/panneaux/texte s'adaptent (voir limite connue dans `SECURITY.md` sur la couverture partielle).
+- **Onboarding** : modal 4 étapes affiché une seule fois après la première connexion.
+- **Pop-up Premium** : juste après l'onboarding (et une fois la photo obligatoire ajoutée), un second pop-up présente les avantages du Premium et les deux façons de l'obtenir (parrainage, partage), avec un lien direct vers l'onglet Profil. Affiché une seule fois par compte, et jamais si le compte est déjà Premium.
+- **Notifications navigateur** : nouveau match/message signalé quand l'onglet est en arrière-plan (voir limite connue : ne fonctionne pas app complètement fermée).
+- **Présence en ligne** : badge vert en temps réel via Supabase Realtime Presence.
+- **Résilience réseau** : bannière en cas de perte de connexion, rechargement automatique des données au retour du réseau.
 
-Une relecture supplémentaire, en creusant spécifiquement les privilèges d'exécution des fonctions (pas seulement les policies RLS), a trouvé :
-
-6. **Triche encore plus grave que prévu (critique)** — `record_chess_win()` était directement appelable par n'importe quel client via RPC, sans aucune vérification qu'une partie avait réellement été gagnée : il suffisait d'appeler la fonction avec son propre id comme gagnant pour s'octroyer de l'Elo et fabriquer un faux historique de victoires, sur n'importe quel match. Corrigé : l'exécution directe est révoquée pour tous les rôles (y compris `PUBLIC`, à qui Postgres accorde `EXECUTE` par défaut sur toute nouvelle fonction) — seul l'appel interne depuis `make_chess_move()` (qui valide tout correctement) reste possible, car le propriétaire d'une fonction conserve toujours ses propres droits d'exécution.
-7. **Privilège par défaut de Postgres non révoqué** — `PUBLIC` (donc potentiellement `anon`, les visiteurs non connectés) avait un accès d'exécution implicite sur toutes les fonctions, y compris `make_chess_move` et `delete_own_account`. L'impact réel était limité (ces fonctions vérifient `auth.uid()` en interne), mais révoqué explicitement par prudence.
-8. **Signalements non protégés contre le spam** — ajout d'une limite de 10 signalements/heure par utilisateur, et vérification qu'un `message_id` signalé appartient bien à un match dont le signaleur fait partie.
-9. **Aucune limite serveur sur les photos de profil** — le bucket de stockage n'imposait ni taille max ni type de fichier ; un client pouvait contourner les vérifications faites côté interface. Corrigé au niveau du bucket lui-même (5 Mo max, images uniquement).
-
-## Troisième passe de sécurité — points de la liste fine résolus
-
-1. **Blocage désormais réellement appliqué en base** — `blocked_users` a été déplacée plus tôt dans le schéma pour que `public_profiles`, `swipes` et `messages` puissent tous s'appuyer dessus. Un utilisateur bloqué ne peut plus swiper, matcher, ni écrire à la personne qui l'a bloqué (ou l'inverse) même en appelant l'API directement, et `public_profiles` n'expose plus le profil d'un utilisateur bloqué dans un sens comme dans l'autre.
-2. **Vérification des 18+ côté serveur** — `handle_new_user()` rejette désormais toute inscription sans date de naissance valide indiquant 18 ans ou plus, quel que soit le chemin utilisé (interface ou appel direct à l'API). *Limite à connaître* : l'API d'authentification de Supabase a tendance à renvoyer un message générique ("Database error saving new user") plutôt que le message précis levé par le trigger — la validation elle-même fonctionne, seul l'affichage de l'erreur exacte n'est pas garanti pour quelqu'un qui contournerait l'interface.
-3. **Consentement aux CGU réellement vérifié** — le client transmet maintenant `accepted_terms` dans les métadonnées d'inscription, et le trigger refuse la création de compte si ce champ n'est pas explicitement `true`. `terms_accepted_at` ne peut plus être enregistré sans consentement réel.
-4. **Limites de longueur** sur `profiles.name/bio/aperitif`, `messages.text`, `reports.details`, et contrainte `CHECK` sur `reports.reason` (valeurs autorisées limitées à celles utilisées par l'app).
-5. **`reports.reported_id` vérifié** — on ne peut plus signaler que quelqu'un avec qui on a un match existant.
-6. **Index ajoutés** sur `(sender_id/swiper_id/reporter_id, created_at)` pour que les triggers anti-spam n'aient plus à scanner toute la table à chaque insertion.
-7. **`games_set_initial_turn()` sécurisée** — lève désormais une exception explicite plutôt que de laisser silencieusement `turn_user_id` à `NULL` (ce qui aurait rendu une partie injouable pour toujours sans message d'erreur).
-8. **Garde-fou `winner ≠ loser`** ajouté dans `record_chess_win`, en plus de la restriction d'accès déjà en place.
-9. **`WITH CHECK` explicite** ajouté à la policy `UPDATE` de `profiles` (le comportement était déjà correct implicitement, mais dépendait d'un défaut Postgres plutôt que d'une intention écrite).
-10. Nettoyage de la numérotation des commentaires de section (dédoublonnage).
-
-**Résiduel, non traité par choix (déjà documenté comme acceptable ou hors-code)** : colonne `profiles.city` inutilisée, coordonnées GPS auto-déclarées par l'utilisateur (comportement voulu), configuration des Redirect URLs dans le dashboard Supabase, stockage du JWT en `localStorage` par le SDK (standard pour une SPA).
-
-Comme pour les passes précédentes, ces correctifs SQL ont été vérifiés syntaxiquement (parenthèses, découpage des instructions) mais pas exécutés contre une vraie instance Postgres dans cet environnement — à valider sur un projet Supabase de test avant la production, en particulier en essayant de créer un compte avec une fausse date de naissance ou sans cocher les CGU pour confirmer que le rejet fonctionne bien.
+### Sécurité générale
+- Row Level Security activé sur toutes les tables.
+- Anti-spam : limites de débit sur messages (20/min), swipes (60/min + 25/jour pour les comptes gratuits) et signalements (10/heure), avec index dédiés.
+- Détail complet des failles trouvées et corrigées, ainsi que les limites connues restantes : voir [`SECURITY.md`](./SECURITY.md).
 
 ## Structure du projet
 
@@ -134,11 +139,30 @@ Comme pour les passes précédentes, ces correctifs SQL ont été vérifiés syn
 ├── package.json
 ├── vite.config.js
 ├── .env.example
+├── SECURITY.md            ← audit de sécurité + limites connues
 ├── supabase/
-│   └── schema.sql        ← à exécuter dans Supabase SQL Editor
+│   └── schema.sql         ← à exécuter dans Supabase SQL Editor
 └── src/
     ├── main.jsx
-    ├── App.jsx            ← toute l'UI + logique Supabase
-    ├── chess.js           ← moteur d'échecs (règles de déplacement)
-    └── supabaseClient.js  ← initialisation du client Supabase
+    ├── App.jsx             ← toute l'UI + logique Supabase
+    ├── chess.js            ← moteur d'échecs (règles de déplacement)
+    └── supabaseClient.js   ← initialisation du client Supabase
 ```
+
+## Structure de la base
+
+| Table | Rôle |
+|---|---|
+| `profiles` | Un profil par utilisateur — infos publiques et privées (email, GPS exact, Elo, Premium...) |
+| `public_profiles` (vue) | Ce que les autres utilisateurs voient réellement — jamais l'email, la date de naissance ou les coordonnées GPS brutes |
+| `profile_photos` | Photos multiples par profil (max 6), pour le carrousel |
+| `swipes` | Historique des passer/trinquer/super-trinquer |
+| `matches` | Créée automatiquement par trigger sur swipe mutuel |
+| `match_reads` | Dernière lecture d'un match par utilisateur (badge non-lu) |
+| `messages` | Chat par match |
+| `blocked_users` | Blocages, appliqués au niveau RLS (pas juste l'interface) |
+| `reports` | Signalements, avec ou sans match |
+| `games` | État d'une partie d'échecs par match |
+| `game_history` | Historique des parties terminées + évolution Elo |
+| `referrals` | Parrainages (parrain, filleul, date de confirmation) |
+| `link_opens` | Ouvertures distinctes du lien de parrainage (par `visitor_id`), pour la récompense "partages" |

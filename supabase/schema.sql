@@ -1,14 +1,16 @@
 -- ============================================================
--- Échec & Match — schéma Supabase complet
--- À exécuter dans l'éditeur SQL de votre projet Supabase
--- (Dashboard > SQL Editor > New query > coller > Run)
+-- Échec & Match — schéma Supabase complet (version idempotente)
+-- Relançable autant de fois que voulu : sur une base vide comme
+-- sur une base existante. Tout est dans une transaction : si une
+-- erreur survient, rien n'est appliqué (pas d'état à moitié fait).
 -- ============================================================
 
--- Extension pour uuid
+begin;
+
 create extension if not exists "pgcrypto";
 
 -- ------------------------------------------------------------
--- 1. PROFILES — un profil par utilisateur (lié à auth.users)
+-- 1. PROFILES
 -- ------------------------------------------------------------
 create table if not exists public.profiles (
   id             uuid primary key references auth.users(id) on delete cascade,
@@ -16,6 +18,9 @@ create table if not exists public.profiles (
   name           text not null check (char_length(name) between 1 and 60),
   age            int not null default 25,
   birthdate      date,
+  gender         text not null default 'autre' check (gender in ('homme', 'femme', 'autre')),
+  orientation    text not null default 'autre' check (orientation in ('hetero', 'gay', 'bi', 'autre')),
+  looking_for    text[] not null default array['homme', 'femme', 'autre'] check (looking_for <@ array['homme', 'femme', 'autre']),
   lat            double precision,
   lng            double precision,
   city           text,
@@ -26,18 +31,78 @@ create table if not exists public.profiles (
   photo_url      text,
   elo            int not null default 1200,
   board_theme    text not null default 'sauge',
+  is_premium     boolean not null default false,
+  premium_until  timestamptz,
+  referral_code  text unique,
+  referred_by    uuid references public.profiles(id),
+  referral_rewards_granted int not null default 0,
+  visitor_id     text,
+  link_opens_rewards_granted int not null default 0,
+  link_reward_at timestamptz,
+  is_admin       boolean not null default false,
   terms_accepted_at timestamptz,
   created_at     timestamptz not null default now()
 );
 
+-- Mise à niveau d'une table existante créée avec une ancienne version
+alter table public.profiles
+  add column if not exists birthdate date,
+  add column if not exists gender text not null default 'autre',
+  add column if not exists orientation text not null default 'autre',
+  add column if not exists looking_for text[] not null default array['homme', 'femme', 'autre'],
+  add column if not exists lat double precision,
+  add column if not exists lng double precision,
+  add column if not exists city text,
+  add column if not exists photo_url text,
+  add column if not exists elo int not null default 1200,
+  add column if not exists board_theme text not null default 'sauge',
+  add column if not exists is_premium boolean not null default false,
+  add column if not exists premium_until timestamptz,
+  add column if not exists referral_code text unique,
+  add column if not exists referred_by uuid references public.profiles(id),
+  add column if not exists referral_rewards_granted int not null default 0,
+  add column if not exists visitor_id text,
+  add column if not exists link_opens_rewards_granted int not null default 0,
+  add column if not exists link_reward_at timestamptz,
+  add column if not exists is_admin boolean not null default false,
+  add column if not exists terms_accepted_at timestamptz;
+
+-- Thèmes "nuit" / "bordeaux" réservés au premium (vérifié en base)
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'board_theme_premium_gate') then
+    alter table public.profiles add constraint board_theme_premium_gate
+      check (is_premium = true or board_theme in ('sauge', 'ivoire')) not valid;
+  end if;
+end $$;
+
 -- ------------------------------------------------------------
--- 1bis. Création automatique du profil à l'inscription
+-- 1bis. REFERRALS (créée tôt car utilisée par handle_new_user)
 -- ------------------------------------------------------------
--- On ne peut pas insérer le profil depuis le client juste après
--- signUp() car, tant que l'email n'est pas confirmé, il n'y a pas
--- de session (RLS bloquerait l'insert). On utilise donc un trigger
--- côté serveur (security definer) qui lit les métadonnées passées
--- à supabase.auth.signUp({ options: { data: {...} } }).
+create table if not exists public.referrals (
+  id                  uuid primary key default gen_random_uuid(),
+  referrer_id         uuid not null references public.profiles(id) on delete cascade,
+  referred_id         uuid references public.profiles(id) on delete set null,
+  referred_created_at timestamptz,
+  confirmed_at        timestamptz,
+  created_at          timestamptz not null default now(),
+  unique (referred_id)
+);
+
+alter table public.referrals
+  add column if not exists referred_created_at timestamptz,
+  add column if not exists confirmed_at timestamptz;
+
+alter table public.referrals enable row level security;
+
+drop policy if exists "Un utilisateur voit ses propres parrainages" on public.referrals;
+create policy "Un utilisateur voit ses propres parrainages"
+  on public.referrals for select to authenticated
+  using (auth.uid() = referrer_id);
+
+-- ------------------------------------------------------------
+-- 1ter. Création automatique du profil à l'inscription
+-- ------------------------------------------------------------
 create or replace function public.handle_new_user()
 returns trigger
 language plpgsql
@@ -50,11 +115,26 @@ declare
   uname text := coalesce(new.raw_user_meta_data->>'name', split_part(new.email,'@',1));
   parsed_birthdate date := nullif(new.raw_user_meta_data->>'birthdate', '')::date;
   accepted_terms boolean := coalesce((new.raw_user_meta_data->>'accepted_terms')::boolean, false);
+  parsed_gender text := lower(coalesce(new.raw_user_meta_data->>'gender', 'autre'));
+  parsed_orientation text := lower(coalesce(new.raw_user_meta_data->>'orientation', 'autre'));
+  parsed_looking_for text[];
+  new_referral_code text;
+  referrer_row record;
 begin
-  -- Vérification d'âge côté serveur : le formulaire côté client peut être
-  -- contourné par un appel direct à l'API d'inscription. Sans date de
-  -- naissance valide indiquant 18 ans ou plus, l'inscription est bloquée
-  -- entièrement (l'insertion dans auth.users elle-même est annulée).
+  if parsed_gender not in ('homme', 'femme', 'autre') then parsed_gender := 'autre'; end if;
+  if parsed_orientation not in ('hetero', 'gay', 'bi', 'autre') then parsed_orientation := 'autre'; end if;
+
+  begin
+    select array_agg(lower(value)) into parsed_looking_for
+    from jsonb_array_elements_text(coalesce(new.raw_user_meta_data->'looking_for', '[]'::jsonb)) as value
+    where lower(value) in ('homme', 'femme', 'autre');
+  exception when others then
+    parsed_looking_for := null;
+  end;
+  if parsed_looking_for is null or array_length(parsed_looking_for, 1) is null then
+    parsed_looking_for := array['homme', 'femme', 'autre'];
+  end if;
+
   if parsed_birthdate is null then
     raise exception 'Date de naissance manquante ou invalide.';
   end if;
@@ -64,21 +144,47 @@ begin
   if not accepted_terms then
     raise exception 'Les CGU et la politique de confidentialité doivent être acceptées.';
   end if;
+  if lower(split_part(new.email, '@', 2)) not in ('gmail.com', 'outlook.com', 'icloud.com') then
+    raise exception 'Seules les adresses Gmail, Outlook ou iCloud sont acceptées.';
+  end if;
 
-  insert into public.profiles (id, email, name, age, birthdate, bio, aperitif, initials, hue, terms_accepted_at)
+  loop
+    new_referral_code := upper(substr(md5(random()::text || new.id::text), 1, 8));
+    exit when not exists (select 1 from public.profiles where referral_code = new_referral_code);
+  end loop;
+
+  insert into public.profiles (id, email, name, age, birthdate, gender, orientation, looking_for, bio, aperitif, initials, hue, terms_accepted_at, referral_code)
   values (
     new.id,
     new.email,
     uname,
     extract(year from age(parsed_birthdate))::int,
     parsed_birthdate,
+    parsed_gender,
+    parsed_orientation,
+    parsed_looking_for,
     coalesce(new.raw_user_meta_data->>'bio', ''),
     coalesce(new.raw_user_meta_data->>'aperitif', ''),
     upper(left(regexp_replace(uname, '\s.*$', ''), 2)),
     chosen_hue,
-    now() -- horodatage fiable désormais : on ne l'atteint que si accepted_terms était vraiment true
+    now(),
+    new_referral_code
   )
   on conflict (id) do nothing;
+
+  if new.raw_user_meta_data ? 'referral_code' and trim(coalesce(new.raw_user_meta_data->>'referral_code', '')) <> '' then
+    select * into referrer_row
+    from public.profiles
+    where referral_code = upper(trim(new.raw_user_meta_data->>'referral_code'));
+
+    if found and referrer_row.id <> new.id then
+      update public.profiles set referred_by = referrer_row.id where id = new.id;
+      insert into public.referrals (referrer_id, referred_id, referred_created_at)
+      values (referrer_row.id, new.id, new.created_at)
+      on conflict (referred_id) do nothing;
+    end if;
+  end if;
+
   return new;
 end;
 $$;
@@ -89,11 +195,7 @@ create trigger on_auth_user_created
   for each row execute function public.handle_new_user();
 
 -- ------------------------------------------------------------
--- 1ter. Suppression de compte (RGPD) — supprime le profil et,
--- par cascade, toutes les données liées (swipes, matchs, messages,
--- parties, blocages, signalements). La ligne auth.users elle-même
--- ne peut être supprimée que côté serveur (clé service_role, ex.
--- via une Edge Function) — voir README.
+-- 1quater. Suppression de compte (RGPD)
 -- ------------------------------------------------------------
 create or replace function public.delete_own_account()
 returns void
@@ -106,43 +208,42 @@ begin
 end;
 $$;
 
--- Postgres accorde EXECUTE à PUBLIC par défaut sur toute nouvelle fonction :
--- on le révoque explicitement pour ne garder que l'accès authentifié voulu.
 revoke execute on function public.delete_own_account() from public, anon;
 grant execute on function public.delete_own_account() to authenticated;
 
+-- ------------------------------------------------------------
+-- 1quinquies. Droits sur PROFILES
+-- ------------------------------------------------------------
 alter table public.profiles enable row level security;
 
--- Un utilisateur ne peut lire que sa propre ligne complète (email, date de
--- naissance, coordonnées GPS exactes...). Les autres utilisateurs consultent
--- exclusivement la vue public_profiles ci-dessous, qui expose uniquement les
--- champs non sensibles et une distance calculée — jamais les coordonnées brutes.
+drop policy if exists "Un utilisateur ne lit que son propre profil complet" on public.profiles;
 create policy "Un utilisateur ne lit que son propre profil complet"
-  on public.profiles for select
+  on public.profiles for select to authenticated
   using (auth.uid() = id);
 
-create policy "Un utilisateur peut créer son propre profil"
-  on public.profiles for insert
-  with check (auth.uid() = id);
+-- CORRECTIF SÉCURITÉ : le profil est créé uniquement par le trigger
+-- handle_new_user. Le client ne doit JAMAIS pouvoir insérer un profil,
+-- sinon il pourrait s'en créer un avec is_admin = true / is_premium = true
+-- (ex. après delete_own_account, le compte auth.users restant).
+drop policy if exists "Un utilisateur peut créer son propre profil" on public.profiles;
+revoke insert on public.profiles from public, anon, authenticated;
 
+drop policy if exists "Un utilisateur peut modifier son propre profil" on public.profiles;
 create policy "Un utilisateur peut modifier son propre profil"
-  on public.profiles for update
+  on public.profiles for update to authenticated
   using (auth.uid() = id)
   with check (auth.uid() = id);
 
--- L'Elo, l'email, la date de naissance et l'horodatage d'acceptation des CGU
--- ne doivent jamais être modifiables directement par le client (l'Elo ne doit
--- changer qu'via record_chess_win / make_chess_move, en SECURITY DEFINER).
--- On restreint donc les colonnes réellement autorisées en écriture directe.
-revoke update on public.profiles from authenticated;
-grant update (name, age, bio, aperitif, board_theme, photo_url, lat, lng, city) on public.profiles to authenticated;
+-- Seules ces colonnes sont modifiables directement par le client.
+-- "age" n'en fait plus partie : il est calculé depuis birthdate (vérifiée
+-- à l'inscription), pour qu'on ne puisse pas afficher un faux âge.
+revoke update on public.profiles from public, anon, authenticated;
+grant update (name, bio, aperitif, board_theme, photo_url, lat, lng, city, gender, orientation, looking_for, visitor_id)
+  on public.profiles to authenticated;
 
 -- ------------------------------------------------------------
--- 1quater. BLOCKED_USERS — blocage entre utilisateurs
+-- 1sexies. BLOCKED_USERS
 -- ------------------------------------------------------------
--- Créée tôt car public_profiles, swipes et messages doivent tous
--- pouvoir s'appuyer dessus pour appliquer le blocage réellement,
--- pas seulement au niveau de l'interface.
 create table if not exists public.blocked_users (
   id          uuid primary key default gen_random_uuid(),
   blocker_id  uuid not null references public.profiles(id) on delete cascade,
@@ -153,34 +254,37 @@ create table if not exists public.blocked_users (
 
 alter table public.blocked_users enable row level security;
 
+drop policy if exists "Un utilisateur voit ses propres blocages" on public.blocked_users;
 create policy "Un utilisateur voit ses propres blocages"
-  on public.blocked_users for select
+  on public.blocked_users for select to authenticated
   using (auth.uid() = blocker_id);
 
+drop policy if exists "Un utilisateur peut bloquer quelqu'un" on public.blocked_users;
 create policy "Un utilisateur peut bloquer quelqu'un"
-  on public.blocked_users for insert
+  on public.blocked_users for insert to authenticated
   with check (auth.uid() = blocker_id);
 
+drop policy if exists "Un utilisateur peut débloquer quelqu'un" on public.blocked_users;
 create policy "Un utilisateur peut débloquer quelqu'un"
-  on public.blocked_users for delete
+  on public.blocked_users for delete to authenticated
   using (auth.uid() = blocker_id);
 
 -- ------------------------------------------------------------
--- 1quinquies. PUBLIC_PROFILES — vue exposée aux autres utilisateurs
+-- 1septies. PUBLIC_PROFILES — vue exposée aux autres utilisateurs
 -- ------------------------------------------------------------
--- N'expose jamais : email, birthdate, lat/lng bruts, terms_accepted_at.
--- La distance est calculée côté serveur (formule de la haversine) à partir
--- des coordonnées de l'appelant, jamais renvoyées en clair au client.
--- Exclut aussi tout profil impliqué dans un blocage avec l'appelant, dans
--- les deux sens — le blocage doit être réel, pas seulement un filtre
--- côté client facilement contournable via un appel direct à l'API.
-create or replace view public.public_profiles
+-- Drop + create plutôt que "create or replace" : ce dernier échoue si
+-- la liste des colonnes a changé depuis la version précédente.
+drop view if exists public.public_profiles;
+create view public.public_profiles
 with (security_invoker = false)
 as
 select
   p.id,
   p.name,
-  p.age,
+  coalesce(extract(year from age(p.birthdate))::int, p.age) as age,
+  p.gender,
+  p.orientation,
+  p.looking_for,
   p.bio,
   p.aperitif,
   p.initials,
@@ -188,6 +292,7 @@ select
   p.photo_url,
   p.elo,
   p.board_theme,
+  p.is_premium,
   p.created_at,
   (
     select round(
@@ -204,44 +309,94 @@ select
       and p.lat is not null and p.lng is not null
   ) as distance_km
 from public.profiles p
-where not exists (
-  select 1 from public.blocked_users b
-  where (b.blocker_id = auth.uid() and b.blocked_id = p.id)
-     or (b.blocker_id = p.id and b.blocked_id = auth.uid())
-);
+where auth.uid() is not null
+  and not exists (
+    select 1 from public.blocked_users b
+    where (b.blocker_id = auth.uid() and b.blocked_id = p.id)
+       or (b.blocker_id = p.id and b.blocked_id = auth.uid())
+  );
 
+-- CORRECTIF SÉCURITÉ : Supabase accorde par défaut SELECT à anon sur
+-- toute nouvelle vue. Sans ce revoke, n'importe qui (non connecté) avec
+-- la clé anon pouvait lister tous les profils.
+revoke all on public.public_profiles from public, anon;
 grant select on public.public_profiles to authenticated;
 
 -- ------------------------------------------------------------
--- 2. SWIPES — chaque "passer" / "trinquer" sur un profil
+-- 2. SWIPES
 -- ------------------------------------------------------------
 create table if not exists public.swipes (
   id          uuid primary key default gen_random_uuid(),
   swiper_id   uuid not null references public.profiles(id) on delete cascade,
   swiped_id   uuid not null references public.profiles(id) on delete cascade,
-  direction   text not null check (direction in ('left','right')),
+  direction   text not null check (direction in ('left','right','superlike')),
   created_at  timestamptz not null default now(),
   unique (swiper_id, swiped_id)
 );
 
 alter table public.swipes enable row level security;
 
+drop policy if exists "Un utilisateur voit ses propres swipes" on public.swipes;
 create policy "Un utilisateur voit ses propres swipes"
-  on public.swipes for select
+  on public.swipes for select to authenticated
   using (auth.uid() = swiper_id);
 
+drop policy if exists "Un compte premium voit qui l'a trinqué" on public.swipes;
+create policy "Un compte premium voit qui l'a trinqué"
+  on public.swipes for select to authenticated
+  using (
+    auth.uid() = swiped_id
+    and direction in ('right', 'superlike')
+    and exists (select 1 from public.profiles me where me.id = auth.uid() and me.is_premium and (me.premium_until is null or me.premium_until > now()))
+  );
+
+drop policy if exists "Un utilisateur peut créer ses propres swipes" on public.swipes;
 create policy "Un utilisateur peut créer ses propres swipes"
-  on public.swipes for insert
+  on public.swipes for insert to authenticated
   with check (
     auth.uid() = swiper_id
+    and swiped_id <> auth.uid()
     and not exists (
       select 1 from public.blocked_users b
       where (b.blocker_id = auth.uid() and b.blocked_id = swiped_id)
          or (b.blocker_id = swiped_id and b.blocked_id = auth.uid())
     )
+    and (
+      direction <> 'superlike'
+      or exists (select 1 from public.profiles me where me.id = auth.uid() and me.is_premium and (me.premium_until is null or me.premium_until > now()))
+    )
   );
 
--- Anti-bot : max 60 swipes par minute par utilisateur.
+drop policy if exists "Un utilisateur peut changer la direction de son propre swipe" on public.swipes;
+create policy "Un utilisateur peut changer la direction de son propre swipe"
+  on public.swipes for update to authenticated
+  using (auth.uid() = swiper_id)
+  with check (
+    auth.uid() = swiper_id
+    and swiped_id <> auth.uid()
+    and not exists (
+      select 1 from public.blocked_users b
+      where (b.blocker_id = auth.uid() and b.blocked_id = swiped_id)
+         or (b.blocker_id = swiped_id and b.blocked_id = auth.uid())
+    )
+    and (
+      direction <> 'superlike'
+      or exists (select 1 from public.profiles me where me.id = auth.uid() and me.is_premium and (me.premium_until is null or me.premium_until > now()))
+    )
+  );
+
+-- CORRECTIF : le bouton "Rewind" (premium) fait un delete sur swipes,
+-- mais aucune policy ne l'autorisait → il échouait silencieusement.
+-- Réservé au premium (sinon supprimer/recréer contournerait la limite
+-- de 25 swipes/jour des comptes gratuits).
+drop policy if exists "Un compte premium peut annuler son swipe" on public.swipes;
+create policy "Un compte premium peut annuler son swipe"
+  on public.swipes for delete to authenticated
+  using (
+    auth.uid() = swiper_id
+    and exists (select 1 from public.profiles me where me.id = auth.uid() and me.is_premium and (me.premium_until is null or me.premium_until > now()))
+  );
+
 create or replace function public.enforce_swipe_rate_limit()
 returns trigger
 language plpgsql
@@ -264,12 +419,42 @@ $$;
 
 drop trigger if exists on_swipe_rate_limit on public.swipes;
 create trigger on_swipe_rate_limit
-  before insert on public.swipes
+  before insert or update on public.swipes
   for each row execute function public.enforce_swipe_rate_limit();
 
+create or replace function public.enforce_daily_swipe_limit()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  is_prem boolean;
+  prem_until timestamptz;
+  today_count int;
+begin
+  select is_premium, premium_until into is_prem, prem_until from public.profiles where id = new.swiper_id;
+  if coalesce(is_prem, false) and (prem_until is null or prem_until > now()) then
+    return new;
+  end if;
+  select count(*) into today_count
+  from public.swipes
+  where swiper_id = new.swiper_id
+    and created_at > now() - interval '24 hours';
+  if today_count >= 25 then
+    raise exception 'Limite de 25 swipes/jour atteinte. Passez Premium pour swiper sans limite.';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists on_daily_swipe_limit on public.swipes;
+create trigger on_daily_swipe_limit
+  before insert on public.swipes
+  for each row execute function public.enforce_daily_swipe_limit();
+
 -- ------------------------------------------------------------
--- 3. MATCHES — créé automatiquement quand deux swipes "right"
---    se répondent (trigger ci-dessous)
+-- 3. MATCHES
 -- ------------------------------------------------------------
 create table if not exists public.matches (
   id          uuid primary key default gen_random_uuid(),
@@ -281,16 +466,16 @@ create table if not exists public.matches (
 
 alter table public.matches enable row level security;
 
+drop policy if exists "Un utilisateur voit ses propres matchs" on public.matches;
 create policy "Un utilisateur voit ses propres matchs"
-  on public.matches for select
+  on public.matches for select to authenticated
   using (auth.uid() = user_a or auth.uid() = user_b);
 
+drop policy if exists "Un participant peut quitter (supprimer) le match" on public.matches;
 create policy "Un participant peut quitter (supprimer) le match"
-  on public.matches for delete
+  on public.matches for delete to authenticated
   using (auth.uid() = user_a or auth.uid() = user_b);
 
--- Trigger : quand un swipe 'right' est inséré, on vérifie si
--- l'autre personne a déjà swipé 'right' sur nous -> crée le match
 create or replace function public.handle_new_swipe()
 returns trigger
 language plpgsql
@@ -302,16 +487,15 @@ declare
   ordered_a uuid;
   ordered_b uuid;
 begin
-  if new.direction = 'right' then
+  if new.direction in ('right', 'superlike') then
     select exists (
       select 1 from public.swipes
       where swiper_id = new.swiped_id
         and swiped_id = new.swiper_id
-        and direction = 'right'
+        and direction in ('right', 'superlike')
     ) into reciprocal_exists;
 
     if reciprocal_exists then
-      -- ordre stable pour respecter la contrainte unique (user_a, user_b)
       if new.swiper_id < new.swiped_id then
         ordered_a := new.swiper_id;
         ordered_b := new.swiped_id;
@@ -331,11 +515,11 @@ $$;
 
 drop trigger if exists on_swipe_created on public.swipes;
 create trigger on_swipe_created
-  after insert on public.swipes
+  after insert or update on public.swipes
   for each row execute function public.handle_new_swipe();
 
 -- ------------------------------------------------------------
--- 4. MESSAGES — chat par match
+-- 4. MESSAGES
 -- ------------------------------------------------------------
 create table if not exists public.messages (
   id          uuid primary key default gen_random_uuid(),
@@ -347,8 +531,9 @@ create table if not exists public.messages (
 
 alter table public.messages enable row level security;
 
+drop policy if exists "Les participants du match voient les messages" on public.messages;
 create policy "Les participants du match voient les messages"
-  on public.messages for select
+  on public.messages for select to authenticated
   using (
     exists (
       select 1 from public.matches m
@@ -357,8 +542,9 @@ create policy "Les participants du match voient les messages"
     )
   );
 
+drop policy if exists "Les participants du match peuvent écrire" on public.messages;
 create policy "Les participants du match peuvent écrire"
-  on public.messages for insert
+  on public.messages for insert to authenticated
   with check (
     auth.uid() = sender_id
     and exists (
@@ -373,8 +559,6 @@ create policy "Les participants du match peuvent écrire"
     )
   );
 
--- Anti-spam : max 20 messages par utilisateur sur les 60 dernières secondes,
--- tous matchs confondus.
 create or replace function public.enforce_message_rate_limit()
 returns trigger
 language plpgsql
@@ -401,7 +585,7 @@ create trigger on_message_rate_limit
   for each row execute function public.enforce_message_rate_limit();
 
 -- ------------------------------------------------------------
--- 5. GAMES — une partie d'échecs par match (état + tour)
+-- 5. GAMES
 -- ------------------------------------------------------------
 create table if not exists public.games (
   id            uuid primary key default gen_random_uuid(),
@@ -419,7 +603,6 @@ create table if not exists public.games (
 
 alter table public.games enable row level security;
 
--- À la création d'une partie, le trait revient toujours à user_a (les blancs).
 create or replace function public.games_set_initial_turn()
 returns trigger
 language plpgsql
@@ -428,9 +611,6 @@ begin
   if new.turn_user_id is null then
     select user_a into new.turn_user_id from public.matches where id = new.match_id;
   end if;
-  -- Filet de sécurité : si le match n'a pas été trouvé (ne devrait jamais
-  -- arriver vu la policy d'insertion), on bloque plutôt que de créer une
-  -- partie injouable avec turn_user_id resté à NULL.
   if new.turn_user_id is null then
     raise exception 'Impossible de déterminer qui commence : match introuvable.';
   end if;
@@ -443,8 +623,9 @@ create trigger on_game_insert
   before insert on public.games
   for each row execute function public.games_set_initial_turn();
 
+drop policy if exists "Les participants du match voient la partie" on public.games;
 create policy "Les participants du match voient la partie"
-  on public.games for select
+  on public.games for select to authenticated
   using (
     exists (
       select 1 from public.matches m
@@ -453,11 +634,9 @@ create policy "Les participants du match voient la partie"
     )
   );
 
--- La création d'une partie doit obligatoirement partir de la position
--- de départ standard, sans quoi un client malveillant pourrait insérer
--- un plateau truqué avant même la première partie.
+drop policy if exists "Les participants du match peuvent créer la partie" on public.games;
 create policy "Les participants du match peuvent créer la partie"
-  on public.games for insert
+  on public.games for insert to authenticated
   with check (
     exists (
       select 1 from public.matches m
@@ -472,14 +651,12 @@ create policy "Les participants du match peuvent créer la partie"
     and winner_id is null
   );
 
--- Seul le joueur dont c'est le tour (turn_user_id) peut modifier la partie.
--- Empêche un joueur de jouer hors tour en appelant l'API directement.
--- Un coup normal ne peut être joué que via la fonction make_chess_move()
--- (security definer, plus bas), qui valide la légalité du déplacement
--- côté serveur. La policy ci-dessous n'autorise plus qu'une remise à zéro
--- de la partie (retour à la position de départ) directement depuis le client.
+-- CORRECTIF : le reset vérifie maintenant aussi le tour, les pièces
+-- capturées, le joueur qui commence (user_a) et que le match_id reste
+-- un match du joueur (avant, un reset pouvait se donner le trait).
+drop policy if exists "Seul un reset vers la position de départ est permis en direct" on public.games;
 create policy "Seul un reset vers la position de départ est permis en direct"
-  on public.games for update
+  on public.games for update to authenticated
   using (
     exists (
       select 1 from public.matches m
@@ -488,14 +665,22 @@ create policy "Seul un reset vers la position de départ est permis en direct"
     )
   )
   with check (
-    board = '[["br","bn","bb","bq","bk","bb","bn","br"],["bp","bp","bp","bp","bp","bp","bp","bp"],["","","","","","","",""],["","","","","","","",""],["","","","","","","",""],["","","","","","","",""],["wp","wp","wp","wp","wp","wp","wp","wp"],["wr","wn","wb","wq","wk","wb","wn","wr"]]'::jsonb
-    and winner_id is null
+    exists (
+      select 1 from public.matches m
+      where m.id = match_id
+        and (m.user_a = auth.uid() or m.user_b = auth.uid())
+        and m.user_a = turn_user_id
+    )
+    and board = '[["br","bn","bb","bq","bk","bb","bn","br"],["bp","bp","bp","bp","bp","bp","bp","bp"],["","","","","","","",""],["","","","","","","",""],["","","","","","","",""],["","","","","","","",""],["wp","wp","wp","wp","wp","wp","wp","wp"],["wr","wn","wb","wq","wk","wb","wn","wr"]]'::jsonb
+    and turn = 'w'
+    and captured_w = '[]'::jsonb
+    and captured_b = '[]'::jsonb
     and log = '[]'::jsonb
+    and winner_id is null
   );
 
-
 -- ------------------------------------------------------------
--- 7. REPORTS — signalement de profil ou de message
+-- 7. REPORTS
 -- ------------------------------------------------------------
 create table if not exists public.reports (
   id            uuid primary key default gen_random_uuid(),
@@ -509,21 +694,18 @@ create table if not exists public.reports (
 
 alter table public.reports enable row level security;
 
--- Seuls les signalements qu'on a soi-même créés sont visibles côté client
--- (la modération se fait côté back-office avec la clé service_role, hors RLS)
+drop policy if exists "Un utilisateur voit ses propres signalements" on public.reports;
 create policy "Un utilisateur voit ses propres signalements"
-  on public.reports for select
+  on public.reports for select to authenticated
   using (auth.uid() = reporter_id);
 
+drop policy if exists "Un utilisateur peut signaler" on public.reports;
 create policy "Un utilisateur peut signaler"
-  on public.reports for insert
+  on public.reports for insert to authenticated
   with check (
     auth.uid() = reporter_id
-    and exists (
-      select 1 from public.matches m
-      where (m.user_a = auth.uid() and m.user_b = reported_id)
-         or (m.user_b = auth.uid() and m.user_a = reported_id)
-    )
+    and reported_id <> auth.uid()
+    and exists (select 1 from public.profiles p where p.id = reported_id)
     and (
       message_id is null
       or exists (
@@ -535,7 +717,6 @@ create policy "Un utilisateur peut signaler"
     )
   );
 
--- Anti-spam : max 10 signalements par utilisateur sur les 60 dernières minutes.
 create or replace function public.enforce_report_rate_limit()
 returns trigger
 language plpgsql
@@ -561,6 +742,59 @@ create trigger on_report_rate_limit
   before insert on public.reports
   for each row execute function public.enforce_report_rate_limit();
 
+-- ------------------------------------------------------------
+-- 8. PROFILE_PHOTOS
+-- ------------------------------------------------------------
+create table if not exists public.profile_photos (
+  id          uuid primary key default gen_random_uuid(),
+  profile_id  uuid not null references public.profiles(id) on delete cascade,
+  url         text not null,
+  position    int not null default 0,
+  created_at  timestamptz not null default now()
+);
+
+alter table public.profile_photos enable row level security;
+
+-- CORRECTIF : "to authenticated" — avant, un visiteur non connecté
+-- (auth.uid() nul, donc aucun blocage trouvé) voyait toutes les photos.
+drop policy if exists "Les photos sont visibles sauf blocage" on public.profile_photos;
+create policy "Les photos sont visibles sauf blocage"
+  on public.profile_photos for select to authenticated
+  using (
+    not exists (
+      select 1 from public.blocked_users b
+      where (b.blocker_id = auth.uid() and b.blocked_id = profile_id)
+         or (b.blocker_id = profile_id and b.blocked_id = auth.uid())
+    )
+  );
+
+drop policy if exists "Un utilisateur gère ses propres photos" on public.profile_photos;
+create policy "Un utilisateur gère ses propres photos"
+  on public.profile_photos for all to authenticated
+  using (auth.uid() = profile_id)
+  with check (auth.uid() = profile_id);
+
+create or replace function public.enforce_photo_limit()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  photo_count int;
+begin
+  select count(*) into photo_count from public.profile_photos where profile_id = new.profile_id;
+  if photo_count >= 6 then
+    raise exception 'Maximum 6 photos par profil.';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists on_photo_limit on public.profile_photos;
+create trigger on_photo_limit
+  before insert on public.profile_photos
+  for each row execute function public.enforce_photo_limit();
 
 -- ------------------------------------------------------------
 -- 9. STORAGE — bucket public pour les photos de profil
@@ -571,39 +805,29 @@ on conflict (id) do update set
   file_size_limit = excluded.file_size_limit,
   allowed_mime_types = excluded.allowed_mime_types;
 
+drop policy if exists "Les photos de profil sont visibles par tous" on storage.objects;
 create policy "Les photos de profil sont visibles par tous"
   on storage.objects for select
   using (bucket_id = 'avatars');
 
+drop policy if exists "Un utilisateur peut uploader sa propre photo" on storage.objects;
 create policy "Un utilisateur peut uploader sa propre photo"
-  on storage.objects for insert
+  on storage.objects for insert to authenticated
   with check (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
 
+drop policy if exists "Un utilisateur peut remplacer sa propre photo" on storage.objects;
 create policy "Un utilisateur peut remplacer sa propre photo"
-  on storage.objects for update
-  using (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
+  on storage.objects for update to authenticated
+  using (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text)
+  with check (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
 
+drop policy if exists "Un utilisateur peut supprimer sa propre photo" on storage.objects;
 create policy "Un utilisateur peut supprimer sa propre photo"
-  on storage.objects for delete
+  on storage.objects for delete to authenticated
   using (bucket_id = 'avatars' and (storage.foldername(name))[1] = auth.uid()::text);
 
 -- ------------------------------------------------------------
--- 9bis. Realtime — activer la réplication pour le chat et les parties
--- ------------------------------------------------------------
-alter publication supabase_realtime add table public.messages;
-alter publication supabase_realtime add table public.games;
-alter publication supabase_realtime add table public.matches;
-
--- ------------------------------------------------------------
--- 10. Auto-création du profil à l'inscription (optionnel, en plus
---     de l'insert côté client dans AuthScreen)
--- ------------------------------------------------------------
--- Le profil est créé explicitement depuis le client juste après
--- supabase.auth.signUp() car on a besoin des champs du formulaire
--- (nom, date de naissance, bio, apéro). Rien à faire ici.
-
--- ------------------------------------------------------------
--- 11. GAME_HISTORY — trace des parties terminées + évolution Elo
+-- 11. GAME_HISTORY + Elo
 -- ------------------------------------------------------------
 create table if not exists public.game_history (
   id                  uuid primary key default gen_random_uuid(),
@@ -618,13 +842,11 @@ create table if not exists public.game_history (
 
 alter table public.game_history enable row level security;
 
+drop policy if exists "Un joueur voit ses propres parties terminées" on public.game_history;
 create policy "Un joueur voit ses propres parties terminées"
-  on public.game_history for select
+  on public.game_history for select to authenticated
   using (auth.uid() = winner_id or auth.uid() = loser_id);
 
--- Met à jour l'Elo des deux joueurs et journalise la partie.
--- security definer car un joueur ne peut normalement pas modifier
--- le profil (donc l'Elo) de son adversaire directement.
 create or replace function public.record_chess_win(p_match_id uuid, p_winner_id uuid, p_loser_id uuid)
 returns void
 language plpgsql
@@ -659,23 +881,12 @@ begin
 end;
 $$;
 
--- IMPORTANT : cette fonction ne doit JAMAIS être appelable directement par
--- un client — elle fait confiance à winner_id/loser_id fournis en paramètre
--- sans vérifier qu'une partie a réellement été gagnée. Elle n'est destinée
--- qu'à un appel interne depuis make_chess_move() (qui, lui, valide tout).
--- Le rôle propriétaire de make_chess_move conserve un accès implicite à ses
--- propres fonctions même après cette révocation : l'appel interne continue
--- de fonctionner, seul l'appel RPC direct depuis un client est bloqué.
-revoke execute on function public.record_chess_win(uuid, uuid, uuid) from public, authenticated, anon;
-
-alter publication supabase_realtime add table public.game_history;
+-- Jamais appelable par un client : uniquement en interne depuis make_chess_move
+revoke execute on function public.record_chess_win(uuid, uuid, uuid) from public, anon, authenticated;
 
 -- ------------------------------------------------------------
--- 12. MAKE_CHESS_MOVE — validation des coups d'échecs côté serveur
+-- 12. MAKE_CHESS_MOVE — validation des coups côté serveur
 -- ------------------------------------------------------------
--- Reproduit les règles de déplacement (sans détection d'échec/mat
--- fine, comme côté client) pour empêcher un client malveillant de
--- forcer un coup illégal en appelant l'API directement.
 create or replace function public.make_chess_move(
   p_game_id uuid,
   p_from_r int,
@@ -847,10 +1058,322 @@ revoke execute on function public.make_chess_move(uuid, int, int, int, int) from
 grant execute on function public.make_chess_move(uuid, int, int, int, int) to authenticated;
 
 -- ------------------------------------------------------------
--- 13. INDEX — supportent les triggers anti-spam (comptage sur une
---     fenêtre de temps récente par utilisateur), évitent un scan
---     complet de la table à chaque insertion.
+-- 13. INDEX (triggers anti-spam)
 -- ------------------------------------------------------------
 create index if not exists idx_swipes_swiper_created on public.swipes (swiper_id, created_at desc);
 create index if not exists idx_messages_sender_created on public.messages (sender_id, created_at desc);
 create index if not exists idx_reports_reporter_created on public.reports (reporter_id, created_at desc);
+
+-- ------------------------------------------------------------
+-- 14. MATCH_READS — messages non lus
+-- ------------------------------------------------------------
+create table if not exists public.match_reads (
+  user_id      uuid not null references public.profiles(id) on delete cascade,
+  match_id     uuid not null references public.matches(id) on delete cascade,
+  last_read_at timestamptz not null default now(),
+  primary key (user_id, match_id)
+);
+
+alter table public.match_reads enable row level security;
+
+drop policy if exists "Un utilisateur gère ses propres marqueurs de lecture" on public.match_reads;
+create policy "Un utilisateur gère ses propres marqueurs de lecture"
+  on public.match_reads for all to authenticated
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);
+
+-- ------------------------------------------------------------
+-- 15. PARRAINAGE
+-- ------------------------------------------------------------
+create or replace function public.handle_email_confirmed()
+returns trigger
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  ref_row record;
+begin
+  if new.email_confirmed_at is not null and old.email_confirmed_at is null then
+    select * into ref_row from public.referrals where referred_id = new.id and confirmed_at is null;
+    if found then
+      -- Confirmation en moins de 15 s = probablement un script : marquée
+      -- 'epoch' pour ne jamais compter dans evaluate_referral_rewards().
+      if new.created_at is not null and new.email_confirmed_at - new.created_at < interval '15 seconds' then
+        update public.referrals set confirmed_at = 'epoch'::timestamptz where id = ref_row.id;
+      else
+        update public.referrals set confirmed_at = now() where id = ref_row.id;
+      end if;
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists on_email_confirmed on auth.users;
+create trigger on_email_confirmed
+  after update on auth.users
+  for each row execute function public.handle_email_confirmed();
+
+create or replace function public.evaluate_referral_rewards()
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  confirmed_count int;
+  already_granted int;
+begin
+  select referral_rewards_granted into already_granted from public.profiles where id = auth.uid();
+  if coalesce(already_granted, 0) >= 1 then
+    return;
+  end if;
+
+  select count(*) into confirmed_count
+  from public.referrals
+  where referrer_id = auth.uid()
+    and referred_id is not null
+    and confirmed_at is not null
+    and confirmed_at > 'epoch'::timestamptz
+    and confirmed_at <= now() - interval '48 hours';
+
+  if confirmed_count >= 2 then
+    update public.profiles
+    set is_premium = true,
+        premium_until = greatest(coalesce(premium_until, now()), now()) + interval '1 month',
+        referral_rewards_granted = 1
+    where id = auth.uid();
+  end if;
+end;
+$$;
+
+revoke execute on function public.evaluate_referral_rewards() from public, anon;
+grant execute on function public.evaluate_referral_rewards() to authenticated;
+
+-- CORRECTIF BUG : avant, si l'utilisateur avait un thème premium
+-- ("nuit"/"bordeaux"), passer is_premium à false violait la contrainte
+-- board_theme_premium_gate → l'update échouait → le Premium n'expirait
+-- jamais. On remet donc le thème à "sauge" dans le même update.
+create or replace function public.settle_my_premium_status()
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  update public.profiles
+  set is_premium = false,
+      board_theme = case when board_theme in ('sauge', 'ivoire') then board_theme else 'sauge' end
+  where id = auth.uid()
+    and is_premium
+    and premium_until is not null
+    and premium_until <= now();
+end;
+$$;
+
+revoke execute on function public.settle_my_premium_status() from public, anon;
+grant execute on function public.settle_my_premium_status() to authenticated;
+
+-- ------------------------------------------------------------
+-- 16. OUVERTURES DE LIEN
+-- ------------------------------------------------------------
+create table if not exists public.link_opens (
+  id           uuid primary key default gen_random_uuid(),
+  referrer_id  uuid not null references public.profiles(id) on delete cascade,
+  visitor_id   text not null,
+  created_at   timestamptz not null default now(),
+  unique (referrer_id, visitor_id)
+);
+
+alter table public.link_opens enable row level security;
+
+drop policy if exists "Un utilisateur voit ses propres ouvertures de lien" on public.link_opens;
+create policy "Un utilisateur voit ses propres ouvertures de lien"
+  on public.link_opens for select to authenticated
+  using (auth.uid() = referrer_id);
+
+create or replace function public.record_link_open(p_referral_code text, p_visitor_id text)
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  referrer_row record;
+begin
+  if p_visitor_id is null or length(trim(p_visitor_id)) = 0 or length(p_visitor_id) > 100 then
+    return;
+  end if;
+
+  select * into referrer_row from public.profiles where referral_code = upper(trim(p_referral_code));
+  if not found then
+    return;
+  end if;
+
+  if referrer_row.visitor_id is not null and referrer_row.visitor_id = p_visitor_id then
+    return;
+  end if;
+
+  -- Pendant un Premium actif, les ouvertures ne comptent pas : la
+  -- récompense n'est pas cumulable, le compteur est en pause.
+  if referrer_row.is_premium and (referrer_row.premium_until is null or referrer_row.premium_until > now()) then
+    return;
+  end if;
+
+  insert into public.link_opens (referrer_id, visitor_id)
+  values (referrer_row.id, p_visitor_id)
+  on conflict (referrer_id, visitor_id) do nothing;
+end;
+$$;
+
+revoke execute on function public.record_link_open(text, text) from public;
+grant execute on function public.record_link_open(text, text) to authenticated, anon;
+
+-- Récompense partages : 5 ouvertures distinctes → 2 semaines de Premium.
+-- Répétable, mais UNE À LA FOIS : rien n'est accordé tant qu'un Premium
+-- est actif, et seules les ouvertures postérieures à la dernière
+-- récompense comptent (le compteur repart de zéro après chaque récompense).
+create or replace function public.evaluate_link_open_rewards()
+returns void
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  me record;
+  new_opens int;
+begin
+  select * into me from public.profiles where id = auth.uid() for update;
+  if not found then return; end if;
+
+  if me.is_premium and (me.premium_until is null or me.premium_until > now()) then
+    return;
+  end if;
+
+  select count(*) into new_opens
+  from public.link_opens
+  where referrer_id = auth.uid()
+    and created_at > coalesce(me.link_reward_at, '-infinity'::timestamptz);
+
+  if new_opens >= 5 then
+    update public.profiles
+    set is_premium = true,
+        premium_until = now() + interval '14 days',
+        link_reward_at = now(),
+        link_opens_rewards_granted = link_opens_rewards_granted + 1
+    where id = auth.uid();
+  end if;
+end;
+$$;
+
+-- Migration : les comptes déjà récompensés avec l'ancien système repartent
+-- de zéro (sinon leurs anciennes ouvertures recompteraient).
+update public.profiles
+set link_reward_at = now()
+where link_opens_rewards_granted > 0 and link_reward_at is null;
+
+revoke execute on function public.evaluate_link_open_rewards() from public, anon;
+grant execute on function public.evaluate_link_open_rewards() to authenticated;
+
+-- ------------------------------------------------------------
+-- 17. ADMINISTRATION
+-- ------------------------------------------------------------
+-- is_admin ne s'accorde qu'à la main, en base :
+--   update public.profiles set is_admin = true where email = 'ton@email';
+
+create or replace function public.admin_get_stats()
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  result jsonb;
+begin
+  if not exists (select 1 from public.profiles where id = auth.uid() and is_admin) then
+    raise exception 'Accès réservé aux administrateurs.';
+  end if;
+
+  select jsonb_build_object(
+    'total_profiles', (select count(*) from public.profiles),
+    'premium_profiles', (select count(*) from public.profiles where is_premium),
+    'total_matches', (select count(*) from public.matches),
+    'total_messages', (select count(*) from public.messages),
+    'total_games_played', (select count(*) from public.game_history),
+    'total_reports', (select count(*) from public.reports),
+    'reports_last_7_days', (select count(*) from public.reports where created_at > now() - interval '7 days'),
+    'new_profiles_last_7_days', (select count(*) from public.profiles where created_at > now() - interval '7 days'),
+    'total_referrals_confirmed', (select count(*) from public.referrals where confirmed_at is not null and confirmed_at > 'epoch'::timestamptz)
+  ) into result;
+
+  return result;
+end;
+$$;
+
+revoke execute on function public.admin_get_stats() from public, anon;
+grant execute on function public.admin_get_stats() to authenticated;
+
+-- Drop préalable : "create or replace" échoue si le type de retour
+-- (colonnes du "returns table") a changé depuis la version précédente.
+drop function if exists public.admin_get_reports();
+create function public.admin_get_reports()
+returns table (
+  id uuid,
+  reason text,
+  details text,
+  created_at timestamptz,
+  reporter_name text,
+  reported_name text,
+  reported_id uuid,
+  message_text text
+)
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if not exists (select 1 from public.profiles where profiles.id = auth.uid() and profiles.is_admin) then
+    raise exception 'Accès réservé aux administrateurs.';
+  end if;
+
+  return query
+  select
+    r.id,
+    r.reason,
+    r.details,
+    r.created_at,
+    reporter.name as reporter_name,
+    reported.name as reported_name,
+    r.reported_id,
+    msg.text as message_text
+  from public.reports r
+  left join public.profiles reporter on reporter.id = r.reporter_id
+  left join public.profiles reported on reported.id = r.reported_id
+  left join public.messages msg on msg.id = r.message_id
+  order by r.created_at desc
+  limit 200;
+end;
+$$;
+
+revoke execute on function public.admin_get_reports() from public, anon;
+grant execute on function public.admin_get_reports() to authenticated;
+
+-- ------------------------------------------------------------
+-- 18. REALTIME — ajout des tables seulement si pas déjà présentes
+-- ------------------------------------------------------------
+do $$
+declare
+  t text;
+begin
+  foreach t in array array['messages', 'games', 'matches', 'game_history', 'match_reads'] loop
+    if not exists (
+      select 1 from pg_publication_tables
+      where pubname = 'supabase_realtime' and schemaname = 'public' and tablename = t
+    ) then
+      execute format('alter publication supabase_realtime add table public.%I', t);
+    end if;
+  end loop;
+end $$;
+
+commit;
